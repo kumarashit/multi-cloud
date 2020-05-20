@@ -15,52 +15,54 @@
 package s3
 
 import (
-	"net/http"
 	"strings"
 
 	"github.com/emicklei/go-restful"
-	"github.com/micro/go-log"
-	. "github.com/opensds/multi-cloud/s3/pkg/exception"
-	s3 "github.com/opensds/multi-cloud/s3/proto"
-	"golang.org/x/net/context"
-
-	//	"github.com/micro/go-micro/errors"
-	"github.com/opensds/multi-cloud/api/pkg/policy"
+	"github.com/opensds/multi-cloud/api/pkg/common"
+	. "github.com/opensds/multi-cloud/s3/error"
+	"github.com/opensds/multi-cloud/s3/proto"
+	log "github.com/sirupsen/logrus"
 )
 
 func (s *APIService) ObjectDelete(request *restful.Request, response *restful.Response) {
-	if !policy.Authorize(request, response, "object:delete") {
+	url := request.Request.URL
+	bucketName := request.PathParameter("bucketName")
+	objectName := request.PathParameter("objectKey")
+	version := url.Query().Get("versionId")
+	if strings.HasSuffix(url.String(), "/") { // This is for folder.
+		objectName = objectName + "/"
+	}
+
+	if len(bucketName) == 0 {
+		log.Errorf("invalid input, bucket=%s\n", bucketName)
+		WriteErrorResponse(response, request, ErrInvalidBucketName)
 		return
 	}
-	url := request.Request.URL
-	log.Logf("URL is %v", request.Request.URL.String())
-	bucketName := request.PathParameter("bucketName")
-	objectKey := request.PathParameter("objectKey")
-	if strings.HasSuffix(url.String(), "/") {
-		objectKey = objectKey + "/"
+	if len(objectName) == 0 {
+		log.Errorf("invalid input, object=%s\n", objectName)
+		WriteErrorResponse(response, request, ErrInvalidObjectName)
 	}
-	deleteInput := s3.DeleteObjectInput{Key: objectKey, Bucket: bucketName}
-	ctx := context.Background()
-	objectInput := s3.GetObjectInput{Bucket: bucketName, Key: objectKey}
-	objectMD, _ := s.s3Client.GetObject(ctx, &objectInput)
-	if objectMD != nil {
-		client := getBackendByName(s, objectMD.Backend)
-		s3err := client.DELETE(&deleteInput, ctx)
-		if s3err.Code != ERR_OK {
-			response.WriteError(http.StatusInternalServerError, s3err.Error())
-			return
-		}
-		res, err := s.s3Client.DeleteObject(ctx, &deleteInput)
-		if err != nil {
-			log.Logf("err is %v\n", err)
-			response.WriteError(http.StatusInternalServerError, err)
-			return
-		}
-		log.Logf("Delete object %s successfully.", objectKey)
-		response.WriteEntity(res)
-	} else {
-		log.Logf("No such object")
+
+	input := s3.DeleteObjectInput{Bucket: bucketName, Key: objectName}
+	if len(version) > 0 {
+		input.VersioId = version
+	}
+	ctx := common.InitCtxWithAuthInfo(request)
+	rsp, err := s.s3Client.DeleteObject(ctx, &input)
+	if HandleS3Error(response, request, err, rsp.GetErrorCode()) != nil {
+		log.Errorf("delete object[%s] failed, err=%v, errCode=%d\n", objectName, err, rsp.GetErrorCode())
 		return
 	}
 
+	if rsp.DeleteMarker {
+		response.Header().Set("x-amz-delete-marker", "true")
+	} else {
+		response.Header().Set("x-amz-delete-marker", "false")
+	}
+	if rsp.VersionId != "" {
+		response.Header().Set("x-amz-version-id", rsp.VersionId)
+	}
+
+	log.Infof("delete object[%s] from bucket[%s] succeed.", objectName, bucketName)
+	WriteSuccessNoContent(response)
 }

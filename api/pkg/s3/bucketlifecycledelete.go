@@ -15,57 +15,23 @@
 package s3
 
 import (
-	"net/http"
-	"strings"
-
 	"github.com/emicklei/go-restful"
-	"github.com/micro/go-log"
-	"github.com/opensds/multi-cloud/api/pkg/policy"
-	s3 "github.com/opensds/multi-cloud/s3/proto"
-	"golang.org/x/net/context"
+	"github.com/opensds/multi-cloud/api/pkg/common"
+	"github.com/opensds/multi-cloud/s3/proto"
+	log "github.com/sirupsen/logrus"
 )
 
 func (s *APIService) BucketLifecycleDelete(request *restful.Request, response *restful.Response) {
-	if !policy.Authorize(request, response, "bucket:delete") {
-		return
-	}
-	//var foundID int
-	FoundIDArray := []string{}
-	NonFoundIDArray := []string{}
 	bucketName := request.PathParameter("bucketName")
-	ruleID := request.Request.URL.Query()["ruleID"]
-	if ruleID != nil {
-		ctx := context.Background()
-		bucket, _ := s.s3Client.GetBucket(ctx, &s3.Bucket{Name: bucketName})
-		for _, id := range ruleID {
-			isfound := false
-			for _, lcRule := range bucket.LifecycleConfiguration {
-				if lcRule.Id == id {
-					isfound = true
-					FoundIDArray = append(FoundIDArray, id)
-				}
-			}
-			if !isfound {
-				NonFoundIDArray = append(NonFoundIDArray, id)
-			}
-		}
-		for _, id := range NonFoundIDArray {
-			response.WriteErrorString(http.StatusBadRequest, strings.Replace("error: rule ID $1 doesn't exist \n\n", "$1", id, 1))
-		}
+	log.Infof("received request for creating lifecycle of bucket: %s", bucketName)
 
-		for _, id := range FoundIDArray {
-			deleteInput := s3.DeleteLifecycleInput{Bucket: bucketName, RuleID: id}
-			res, err := s.s3Client.DeleteBucketLifecycle(ctx, &deleteInput)
-			if err != nil {
-				response.WriteError(http.StatusBadRequest, err)
-				return
-			}
-			response.WriteEntity(res)
-		}
-
-	} else {
-		response.WriteErrorString(http.StatusBadRequest, NoRuleIDForLifecycleDelete)
+	ctx := common.InitCtxWithAuthInfo(request)
+	rsp, err := s.s3Client.DeleteBucketLifecycle(ctx, &s3.BaseRequest{Id: bucketName})
+	log.Infof("rsp:%s, err:%v\n", rsp, err)
+	if HandleS3Error(response, request, err, rsp.GetErrorCode()) != nil {
+		log.Errorf("delete bucket[%s] lifecycle failed, err=%v, errCode=%d\n", bucketName, err, rsp.GetErrorCode())
 		return
 	}
-	log.Log("delete bucket lifecycle successful.")
+
+	log.Info("delete bucket lifecycle end.")
 }

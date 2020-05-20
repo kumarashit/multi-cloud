@@ -15,18 +15,19 @@
 package main
 
 import (
+	"os"
+
 	"github.com/emicklei/go-restful"
-	"github.com/micro/go-log"
 	"github.com/micro/go-web"
 	"github.com/opensds/multi-cloud/api/pkg/backend"
 	"github.com/opensds/multi-cloud/api/pkg/dataflow"
-	"github.com/opensds/multi-cloud/api/pkg/filters/context"
-	"github.com/opensds/multi-cloud/api/pkg/filters/signature/signer"
-
-	//	_ "github.com/micro/go-plugins/client/grpc"
 	"github.com/opensds/multi-cloud/api/pkg/filters/auth"
+	"github.com/opensds/multi-cloud/api/pkg/filters/context"
 	"github.com/opensds/multi-cloud/api/pkg/filters/logging"
+	"github.com/opensds/multi-cloud/api/pkg/filters/signature/signer"
 	"github.com/opensds/multi-cloud/api/pkg/s3"
+	log "github.com/sirupsen/logrus"
+	"github.com/opensds/multi-cloud/api/pkg/utils/obs"
 )
 
 const (
@@ -40,32 +41,38 @@ func main() {
 	)
 	webService.Init()
 
+	obs.InitLogs()
 	wc := restful.NewContainer()
-	ws := new(restful.WebService)
-	ws.Path("/v1")
-	ws.Doc("OpenSDS Multi-Cloud API")
-	ws.Consumes(restful.MIME_JSON)
-	ws.Produces(restful.MIME_JSON)
-	ws.Filter(auth.FilterFactory())
 
-	backend.RegisterRouter(ws)
-	dataflow.RegisterRouter(ws)
-	// add filter for authentication context
-	ws.Filter(logging.FilterFactory())
-	ws.Filter(context.FilterFactory())
-	ws.Filter(auth.FilterFactory())
-	
-	s3ws := new(restful.WebService)
-	s3ws.Path("/v1/s3")
-	s3ws.Doc("OpenSDS Multi-Cloud API")
-	s3ws.Consumes(restful.MIME_XML)
-	s3ws.Produces(restful.MIME_XML)
-	s3ws.Filter(logging.FilterFactory())
-	s3ws.Filter(signer.FilterFactory())
-	s3.RegisterRouter(s3ws)
+	flag := os.Getenv("SVC_FLAG")
+	if flag == "s3" {
+		s3ws := new(restful.WebService)
+		s3ws.Path("/")
+		s3ws.Doc("OpenSDS Multi-Cloud API")
+		s3ws.Produces(restful.MIME_XML)
 
-	wc.Add(ws)
-	wc.Add(s3ws)
+		s3ws.Filter(logging.FilterFactory())
+		s3ws.Filter(context.FilterFactory())
+		s3ws.Filter(signer.FilterFactory())
+		s3.RegisterRouter(s3ws)
+
+		wc.Add(s3ws)
+	} else {
+		ws := new(restful.WebService)
+		ws.Path("/")
+		ws.Doc("OpenSDS Multi-Cloud API")
+		ws.Consumes(restful.MIME_JSON)
+		ws.Produces(restful.MIME_JSON)
+
+		backend.RegisterRouter(ws)
+		dataflow.RegisterRouter(ws)
+		// add filter for authentication context
+		ws.Filter(logging.FilterFactory())
+		ws.Filter(context.FilterFactory())
+		ws.Filter(auth.FilterFactory())
+		wc.Add(ws)
+	}
+
 	webService.Handle("/", wc)
 	if err := webService.Run(); err != nil {
 		log.Fatal(err)

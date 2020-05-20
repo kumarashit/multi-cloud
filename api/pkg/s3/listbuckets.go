@@ -15,60 +15,68 @@
 package s3
 
 import (
-	"encoding/xml"
-	"net/http"
 	"time"
 
 	"github.com/emicklei/go-restful"
-	"github.com/micro/go-log"
+	"github.com/opensds/multi-cloud/api/pkg/common"
 	"github.com/opensds/multi-cloud/api/pkg/policy"
-	"github.com/opensds/multi-cloud/s3/pkg/model"
+	. "github.com/opensds/multi-cloud/api/pkg/s3/datatype"
+	"github.com/opensds/multi-cloud/s3/pkg/utils"
 	s3 "github.com/opensds/multi-cloud/s3/proto"
-	"golang.org/x/net/context"
+	log "github.com/sirupsen/logrus"
 )
 
-func parseListBuckets(list *s3.ListBucketsResponse) []byte {
-	if list == nil || list.Buckets == nil {
-		return nil
-	}
-	temp := model.ListAllMyBucketsResult{}
+func parseListBuckets(list *s3.ListBucketsResponse) ListBucketsResponse {
+	resp := ListBucketsResponse{}
 
-	log.Logf("Parse ListBuckets: %v", list.Buckets)
-	//default xmlns
-	temp.Xmlns = model.Xmlns
-	buckets := []model.Bucket{}
+	log.Infof("Parse ListBuckets: %v", list.Buckets)
+	buckets := []Bucket{}
 	for _, value := range list.Buckets {
-		creationDate := time.Unix(value.CreationDate, 0).Format(time.RFC3339)
-		bucket := model.Bucket{Name: value.Name, CreationDate: creationDate, LocationConstraint: value.Backend}
+		ctime := time.Unix(value.CreateTime, 0).Format(timeFormatAMZ)
+		versionOpts := VersioningConfiguration{}
+		versionOpts.Status = utils.VersioningDisabled
+		if value.Versioning != nil {
+			if value.Versioning.Status == utils.VersioningEnabled {
+				versionOpts.Status = utils.VersioningEnabled
+			}
+		}
+		sseOpts := SSEConfiguration{}
+		if value.ServerSideEncryption != nil {
+			if value.ServerSideEncryption.SseType == "SSE" {
+				sseOpts.SSE.Enabled = "true"
+			} else {
+				sseOpts.SSE.Enabled = "false"
+			}
+		}
+		bucket := Bucket{Name: value.Name, CreationDate: ctime, LocationConstraint: value.DefaultLocation,
+			VersionOpts: versionOpts, SSEOpts: sseOpts}
 		buckets = append(buckets, bucket)
 	}
-	temp.Buckets = buckets
+	resp.Buckets.Buckets = buckets
 
-	xmlstring, err := xml.MarshalIndent(temp, "", "  ")
-	if err != nil {
-		log.Logf("Parse ListBuckets error: %v", err)
-		return nil
-	}
-	xmlstring = []byte(xml.Header + string(xmlstring))
-	return xmlstring
+	return resp
 }
 
 func (s *APIService) ListBuckets(request *restful.Request, response *restful.Response) {
 	if !policy.Authorize(request, response, "bucket:list") {
 		return
 	}
-	ctx := context.Background()
-	//TODO owner
-	owner := "test"
-	log.Logf("Received request for all buckets")
-	res, err := s.s3Client.ListBuckets(ctx, &s3.BaseRequest{Id: owner})
-	if err != nil {
-		response.WriteError(http.StatusInternalServerError, err)
+	log.Infof("Received request for all buckets")
+
+	ctx := common.InitCtxWithAuthInfo(request)
+	rsp, err := s.s3Client.ListBuckets(ctx, &s3.BaseRequest{})
+	if HandleS3Error(response, request, err, rsp.GetErrorCode()) != nil {
+		log.Errorf("list bucket failed, err=%v, errCode=%d\n", err, rsp.GetErrorCode())
 		return
 	}
 
-	realRes := parseListBuckets(res)
+	resp := parseListBuckets(rsp)
+	resp.Owner = Owner{}
+	resp.Owner.ID = common.GetOwner(request)
 
-	log.Logf("Get List of buckets successfully:%v\n", string(realRes))
-	response.Write(realRes)
+	// Encode response
+	encodedResp := EncodeResponse(resp)
+	// write response
+	WriteSuccessResponse(response, encodedResp)
+	log.Infoln("List buckets successfully.\n")
 }

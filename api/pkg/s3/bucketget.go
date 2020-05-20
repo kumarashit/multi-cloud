@@ -15,131 +15,190 @@
 package s3
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"net/http"
+	"net/url"
 	"strconv"
-	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/emicklei/go-restful"
-	"github.com/micro/go-log"
 	"github.com/opensds/multi-cloud/api/pkg/common"
-	"github.com/opensds/multi-cloud/api/pkg/policy"
-	s3 "github.com/opensds/multi-cloud/s3/proto"
+	"github.com/opensds/multi-cloud/api/pkg/s3/datatype"
+	"github.com/opensds/multi-cloud/api/pkg/utils/constants"
+	. "github.com/opensds/multi-cloud/s3/error"
+	"github.com/opensds/multi-cloud/s3/pkg/helper"
+	"github.com/opensds/multi-cloud/s3/pkg/utils"
+	"github.com/opensds/multi-cloud/s3/proto"
+	log "github.com/sirupsen/logrus"
 )
 
-func checkLastmodifiedFilter(fmap *map[string]string) error {
-	for k, v := range *fmap {
-		if k != "lt" && k != "lte" && k != "gt" && k != "gte" {
-			log.Logf("invalid query parameter:k=%s,v=%s\n", k, v)
-			return errors.New("invalid query parameter")
-		} else {
-			_, err := strconv.Atoi(v)
-			if err != nil {
-				log.Logf("invalid query parameter:k=%s,v=%s, err=%v\n", k, v, err)
-				return errors.New("invalid query parameter")
+func (s *APIService) BucketGet(request *restful.Request, response *restful.Response) {
+	bucketName := request.PathParameter("bucketName")
+	log.Infof("Received request for bucket details: %s\n", bucketName)
+
+	var err error
+	req, err := parseListObjectsQuery(request.Request.URL.Query())
+	if err != nil {
+		WriteErrorResponse(response, request, err)
+		return
+	}
+	req.Bucket = bucketName
+
+	ctx := common.InitCtxWithAuthInfo(request)
+	lsRsp, err := s.s3Client.ListObjects(ctx, &req)
+	if HandleS3Error(response, request, err, lsRsp.GetErrorCode()) != nil {
+		log.Errorf("get bucket[%s] failed, err=%v, errCode=%d\n", bucketName, err, lsRsp.GetErrorCode())
+		return
+	}
+
+	rsp := CreateListObjectsResponse(bucketName, &req, lsRsp)
+	log.Debugf("rsp:%+v\n", rsp)
+	// Write success response.
+	response.WriteEntity(rsp)
+
+	return
+}
+
+func parseListObjectsQuery(query url.Values) (request s3.ListObjectsRequest, err error) {
+	if query.Get("list-type") == constants.ListObjectsType2Str {
+		request.Version = constants.ListObjectsType2Int
+		request.ContinuationToken = query.Get("continuation-token")
+		request.StartAfter = query.Get("start-after")
+		if !utf8.ValidString(request.StartAfter) {
+			err = ErrNonUTF8Encode
+			return
+		}
+		request.FetchOwner = helper.Ternary(query.Get("fetch-owner") == "true",
+			true, false).(bool)
+	} else {
+		request.Version = constants.ListObjectsType1Int
+		request.Marker = query.Get("marker")
+		if !utf8.ValidString(request.Marker) {
+			err = ErrNonUTF8Encode
+			return
+		}
+		request.FetchOwner = true
+	}
+	request.Delimiter = query.Get("delimiter")
+	if !utf8.ValidString(request.Delimiter) {
+		err = ErrNonUTF8Encode
+		return
+	}
+	request.EncodingType = query.Get("encoding-type")
+	if request.EncodingType != "" && request.EncodingType != "url" {
+		err = ErrInvalidEncodingType
+		return
+	}
+	if query.Get("max-keys") == "" {
+		request.MaxKeys = utils.MaxObjectList
+	} else {
+		var maxKey int
+		maxKey, err = strconv.Atoi(query.Get("max-keys"))
+		if err != nil {
+			log.Errorf("parsing max-keys error:%v\n", err)
+			return request, ErrInvalidMaxKeys
+		}
+		request.MaxKeys = int32(maxKey)
+		if request.MaxKeys > utils.MaxObjectList || request.MaxKeys < 0 {
+			err = ErrInvalidMaxKeys
+			return
+		}
+	}
+	request.Prefix = query.Get("prefix")
+	if !utf8.ValidString(request.Prefix) {
+		err = ErrNonUTF8Encode
+		return
+	}
+
+	request.KeyMarker = query.Get("key-marker")
+	if !utf8.ValidString(request.KeyMarker) {
+		err = ErrNonUTF8Encode
+		return
+	}
+	request.VersionIdMarker = query.Get("version-id-marker")
+	if !utf8.ValidString(request.VersionIdMarker) {
+		err = ErrNonUTF8Encode
+		return
+	}
+
+	log.Infof("request:%+v\n", request)
+	return
+}
+
+// this function refers to GenerateListObjectsResponse in api-response.go from Minio Cloud Storage.
+func CreateListObjectsResponse(bucketName string, request *s3.ListObjectsRequest,
+	listRsp *s3.ListObjectsResponse) (response datatype.ListObjectsResponse) {
+	for _, o := range listRsp.Objects {
+		obj := datatype.Object{
+			Key:          o.ObjectKey,
+			LastModified: time.Unix(o.LastModified, 0).UTC().Format(timeFormatAMZ),
+			ETag:         o.Etag,
+			Size:         o.Size,
+			StorageClass: o.StorageClass,
+			Location:     o.Location,
+			Tier:         o.Tier,
+		}
+		if request.EncodingType != "" { // only support "url" encoding for now
+			obj.Key = UrlEncodeAsAwsS3(obj.Key)
+		}
+		if request.FetchOwner {
+			obj.Owner = &datatype.Owner{
+				ID: o.TenantId,
+				// currently, display name is the same as tenantId
+				DisplayName: o.TenantId, //TODO: DisplayName
 			}
 		}
+		response.Contents = append(response.Contents, obj)
 	}
 
-	return nil
+	var prefixes []datatype.CommonPrefix
+	for _, prefix := range listRsp.Prefixes {
+		item := datatype.CommonPrefix{
+			Prefix: prefix,
+		}
+		prefixes = append(prefixes, item)
+	}
+	response.CommonPrefixes = prefixes
+
+	response.Delimiter = request.Delimiter
+	response.EncodingType = request.EncodingType
+	response.IsTruncated = listRsp.IsTruncated
+	response.MaxKeys = int(request.MaxKeys)
+	response.Prefix = request.Prefix
+	response.BucketName = bucketName
+
+	if request.Version == constants.ListObjectsType2Int {
+		response.KeyCount = len(response.Contents)
+		response.ContinuationToken = request.ContinuationToken
+		response.NextContinuationToken = listRsp.NextMarker
+		response.StartAfter = request.StartAfter
+	} else { // version 1
+		response.Marker = request.Marker
+		response.NextMarker = listRsp.NextMarker
+	}
+
+	if request.EncodingType != "" {
+		response.Delimiter = UrlEncodeAsAwsS3(response.Delimiter)
+		response.Prefix = UrlEncodeAsAwsS3(response.Prefix)
+		response.StartAfter = UrlEncodeAsAwsS3(response.StartAfter)
+	}
+
+	return
 }
 
-func checkObjKeyFilter(val string) (string, error) {
-	// val should be like: objeKey=like:parttern
-	if strings.HasPrefix(val, "like:") == false {
-		log.Logf("invalid object key filter:%s\n", val)
-		return "", fmt.Errorf("invalid object key filter:%s", val)
-	}
-
-	vals := strings.Split(val, ":")
-	if len(vals) <= 1 {
-		log.Logf("invalid object key filter:%s\n", val)
-		return "", fmt.Errorf("invalid object key filter:%s", val)
-	}
-
-	var ret string
-	for i := 1; i < len(vals); i++ {
-		ret = ret + vals[i]
-	}
-
-	return ret, nil
-}
-
-func (s *APIService) BucketGet(request *restful.Request, response *restful.Response) {
-	if !policy.Authorize(request, response, "bucket:get") {
-		return
-	}
-
-	limit, offset, err := common.GetPaginationParam(request)
-	if err != nil {
-		log.Logf("get pagination parameters failed: %v\n", err)
-		response.WriteError(http.StatusInternalServerError, err)
-		return
-	}
-
+func (s *APIService) HeadBucket(request *restful.Request, response *restful.Response) {
 	bucketName := request.PathParameter("bucketName")
-	log.Logf("Received request for bucket details: %s\n", bucketName)
+	log.Infof("Received request for head bucket: %s\n", bucketName)
 
-	filterOpts := []string{common.KObjKey, common.KLastModified}
-	filter, err := common.GetFilter(request, filterOpts)
+	var err error
+
+	ctx := common.InitCtxWithAuthInfo(request)
+	_, err = s.getBucketMeta(ctx, bucketName)
 	if err != nil {
-		log.Logf("get filter failed: %v\n", err)
-		response.WriteError(http.StatusBadRequest, err)
-		return
-	} else {
-		log.Logf("Get filter for BucketGet, filterOpts=%+v, filter=%+v\n",
-			filterOpts, filter)
-	}
-
-	if filter[common.KObjKey] != "" {
-		//filter[common.KObjKey] should be like: like:parttern
-		ret, err := checkObjKeyFilter(filter[common.KObjKey])
-		if err != nil {
-			log.Logf("invalid objkey:%s\v", filter[common.KObjKey])
-			response.WriteError(http.StatusBadRequest,
-				fmt.Errorf("invalid objkey, it should be like objkey=like:parttern"))
-			return
-		}
-		filter[common.KObjKey] = ret
-	}
-
-	// Check validation of query parameter. Example of lastmodified: {"lt":"100", "gt":"30"}
-	if filter[common.KLastModified] != "" {
-		var tmFilter map[string]string
-		err := json.Unmarshal([]byte(filter[common.KLastModified]), &tmFilter)
-		if err != nil {
-			log.Logf("invalid lastModified:%s\v", filter[common.KLastModified])
-			response.WriteError(http.StatusBadRequest,
-				fmt.Errorf("invalid lastmodified, it should be like lastmodified={\"lt\":\"numb\"}"))
-			return
-		}
-		err = checkLastmodifiedFilter(&tmFilter)
-		if err != nil {
-			log.Logf("invalid lastModified:%s\v", filter[common.KLastModified])
-			response.WriteError(http.StatusBadRequest,
-				fmt.Errorf("invalid lastmodified, it should be like lastmodified={\"lt\":\"numb\"}"))
-			return
-		}
-	}
-
-	req := s3.ListObjectsRequest{
-		Bucket: bucketName,
-		Filter: filter,
-		Offset: offset,
-		Limit:  limit,
-	}
-
-	ctx := context.Background()
-	res, err := s.s3Client.ListObjects(ctx, &req)
-	log.Logf("list objects result: %v\n", res)
-	if err != nil {
-		response.WriteError(http.StatusInternalServerError, err)
+		log.Errorf("get bucket[%s] failed, err=%v\n", bucketName, err)
+		WriteErrorResponse(response, request, err)
 		return
 	}
 
-	log.Log("Get bucket successfully.")
-	response.WriteEntity(res)
+	log.Debugln("head bucket succeed")
+	WriteSuccessResponse(response, nil)
 }

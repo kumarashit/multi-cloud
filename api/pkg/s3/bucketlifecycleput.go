@@ -16,22 +16,21 @@ package s3
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/xml"
 	"fmt"
 	"net/http"
-
-	//"sort"
-	"strings"
 	"sync"
-
-	. "github.com/opensds/multi-cloud/api/pkg/utils/constants"
+	"time"
 
 	"github.com/emicklei/go-restful"
-	"github.com/micro/go-log"
-
-	"github.com/opensds/multi-cloud/api/pkg/policy"
+	"github.com/opensds/multi-cloud/api/pkg/common"
+	. "github.com/opensds/multi-cloud/api/pkg/utils/constants"
+	. "github.com/opensds/multi-cloud/s3/error"
 	"github.com/opensds/multi-cloud/s3/pkg/model"
-	s3 "github.com/opensds/multi-cloud/s3/proto"
+	"github.com/opensds/multi-cloud/s3/pkg/utils"
+	"github.com/opensds/multi-cloud/s3/proto"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 )
 
@@ -39,12 +38,14 @@ import (
 var ClassAndTier map[string]int32
 var mutext sync.Mutex
 
+const IdLimiteLen int = 255
+
 func (s *APIService) loadStorageClassDefinition() error {
 	ctx := context.Background()
-	log.Log("Load storage classes.")
+	log.Info("Load storage classes.")
 	res, err := s.s3Client.GetStorageClasses(ctx, &s3.BaseRequest{})
 	if err != nil {
-		log.Logf("get storage classes from s3 service failed: %v\n", err)
+		log.Errorf("get storage classes from s3 service failed: %v\n", err)
 		return err
 	}
 	ClassAndTier = make(map[string]int32)
@@ -61,39 +62,38 @@ func (s *APIService) class2tier(name string) (int32, error) {
 		if len(ClassAndTier) == 0 {
 			err := s.loadStorageClassDefinition()
 			if err != nil {
-				log.Logf("load storage classes failed: %v.\n", err)
+				log.Errorf("load storage classes failed: %v.\n", err)
 				return 0, err
 			}
 		}
 	}
 	tier, ok := ClassAndTier[name]
 	if !ok {
-		log.Logf("translate storage class name[%s] to tier failed: %s.\n", name)
+		log.Errorf("translate storage class name[%s] to tier failed: %s.\n", name)
 		return 0, fmt.Errorf("invalid storage class:%s", name)
 	}
-	log.Logf("class[%s] to tier[%d]\n", name, tier)
+	log.Infof("class[%s] to tier[%d]\n", name, tier)
 	return tier, nil
 }
 
 func checkValidationOfActions(actions []*s3.Action) error {
 	var pre *s3.Action = nil
 	for _, action := range actions {
-		log.Logf("action: %+v\n", *action)
+		log.Infof("action: %+v\n", *action)
 		if pre == nil {
 			if action.Name == ActionNameExpiration && action.Days < ExpirationMinDays {
 				// If only an expiration action for a rule, the days for that action should be more than ExpirationMinDays
-				return fmt.Errorf("error: Days for Expiring object must not be less than %d", ExpirationMinDays)
+				return fmt.Errorf(InvalidExpireDays, ExpirationMinDays)
 			}
 			if action.Name == ActionNameTransition && action.Days < TransitionMinDays {
 				// the days for transition to tiers except tier999 should not less than TransitionMinDays
 				minDays := int32(TransitionMinDays)
-				if action.Tier == Tier999 {
+				if action.Tier == utils.Tier999 {
 					// the days for transition to tier999 should not less than TransitionToArchiveMinDays
 					minDays = TransitionToArchiveMinDays
 				}
 				if action.Days < minDays {
-					return fmt.Errorf("error: days for transitioning object to tier_%d must not be less than %d",
-						action.Tier, minDays)
+					return fmt.Errorf(InvalidTransistionDays, action.Tier, minDays)
 				}
 
 			}
@@ -116,132 +116,184 @@ func checkValidationOfActions(actions []*s3.Action) error {
 	return nil
 }
 
-func (s *APIService) BucketLifecyclePut(request *restful.Request, response *restful.Response) {
-	if !policy.Authorize(request, response, "bucket:put") {
-		return
-	}
-	bucketName := request.PathParameter("bucketName")
-	log.Logf("received request for create bucket lifecycle: %s", bucketName)
-	ctx := context.Background()
-	bucket, _ := s.s3Client.GetBucket(ctx, &s3.Bucket{Name: bucketName})
-	body := ReadBody(request)
-	log.Logf("MD5 sum for body is %x", md5.Sum(body))
-
-	if body != nil {
-		createLifecycleConf := model.LifecycleConfiguration{}
-		err := xml.Unmarshal(body, &createLifecycleConf)
-		if err != nil {
-			response.WriteError(http.StatusInternalServerError, err)
-			return
-		} else {
-			dupIdCheck := make(map[string]interface{})
-			s3RulePtrArr := make([]*s3.LifecycleRule, 0)
-			for _, rule := range createLifecycleConf.Rule {
-				s3Rule := s3.LifecycleRule{}
-
-				//check if the ruleID has any duplicate values
-				if _, ok := dupIdCheck[rule.ID]; ok {
-					log.Logf("duplicate ruleID found for rule : %s\n", rule.ID)
-					ErrStr := strings.Replace(DuplicateRuleIDError, "$1", rule.ID, 1)
-					response.WriteError(http.StatusBadRequest, fmt.Errorf(ErrStr))
-					return
-				}
-				// Assigning the rule ID
-				dupIdCheck[rule.ID] = struct{}{}
-				s3Rule.Id = rule.ID
-
-				//Assigning the status value to s3 status
-				log.Logf("status in rule file is %v\n", rule.Status)
-				s3Rule.Status = rule.Status
-
-				//Assigning the filter, using convert function to convert xml struct to s3 struct
-				s3Rule.Filter = convertRuleFilterToS3Filter(rule.Filter)
-
-				// Create the type of transition array
-				s3ActionArr := make([]*s3.Action, 0)
-
-				for _, transition := range rule.Transition {
-
-					//Defining the Transition array and assigning the values tp populate fields
-					s3Transition := s3.Action{Name: ActionNameTransition}
-
-					//Assigning the value of days for transition to happen
-					s3Transition.Days = transition.Days
-
-					//Assigning the backend value to the s3 struct
-					s3Transition.Backend = transition.Backend
-
-					//Assigning the storage class of the object to s3 struct
-					tier, err := s.class2tier(transition.StorageClass)
-					if err != nil {
-						response.WriteError(http.StatusBadRequest, err)
-						return
-					}
-					s3Transition.Tier = tier
-
-					//Adding the transition value to the main rule
-					s3ActionArr = append(s3ActionArr, &s3Transition)
-				}
-
-				//Loop for getting the values from xml struct
-				for _, expiration := range rule.Expiration {
-					s3Expiration := s3.Action{Name: ActionNameExpiration}
-					s3Expiration.Days = expiration.Days
-					s3ActionArr = append(s3ActionArr, &s3Expiration)
-				}
-
-				//validate actions
-				err := checkValidationOfActions(s3ActionArr)
-				if err != nil {
-					log.Logf("validation of actions failed: %v\n", err)
-					response.WriteError(http.StatusBadRequest, err)
-					return
-				}
-
-				//Assigning the Expiration action to s3 struct expiration
-				s3Rule.Actions = s3ActionArr
-
-				s3Rule.AbortIncompleteMultipartUpload = convertRuleUploadToS3Upload(rule.AbortIncompleteMultipartUpload)
-
-				// add to the s3 array
-				s3RulePtrArr = append(s3RulePtrArr, &s3Rule)
-			}
-			// assign lifecycle rules to s3 bucket
-			bucket.LifecycleConfiguration = s3RulePtrArr
-		}
-	} else {
-		log.Log("no request body provided for creating lifecycle configuration")
-		response.WriteError(http.StatusBadRequest, fmt.Errorf(NoRequestBodyLifecycle))
-		return
+func validLcStatus(status string) bool {
+	switch status {
+	case "Enabled", "Disabled":
+		return true
+	default:
+		log.Errorln("invalid lc status:", status)
 	}
 
-	// Create bucket with bucket name will check if the bucket exists or not, if it exists
-	// it will internally call UpdateBucket function
-	res, err := s.s3Client.UpdateBucket(ctx, bucket)
-	if err != nil {
-		response.WriteError(http.StatusInternalServerError, err)
-		return
-	}
-	log.Log("create bucket lifecycle successful.")
-	response.WriteEntity(res)
-
+	return false
 }
 
-func convertRuleFilterToS3Filter(filter model.Filter) *s3.LifecycleFilter {
-	retFilter := s3.LifecycleFilter{}
-	/*
-		check if prefix is not empty
-	*/
-	if filter.Prefix != "" {
-		retFilter.Prefix = filter.Prefix
-		return &retFilter
-	} else {
+func getRandID() (string, error) {
+	bits := uint64(time.Now().UnixNano())
+	buf := make([]byte, 16)
+
+	readLen, err := rand.Read(buf)
+	if err != nil || readLen != len(buf) {
+		return "", err
+	}
+
+	str := fmt.Sprintf("%X%X", bits, buf)
+	return str, nil
+}
+
+func (s *APIService) BucketLifecyclePut(request *restful.Request, response *restful.Response) {
+	bucketName := request.PathParameter("bucketName")
+	log.Infof("received request for creating lifecycle of bucket: %s", bucketName)
+
+	ctx := common.InitCtxWithAuthInfo(request)
+	_, err := s.getBucketMeta(ctx, bucketName)
+	if err != nil {
+		log.Errorf("get bucket[%s] failed, err=%v\n", bucketName, err)
+		WriteErrorResponse(response, request, err)
+		return
+	}
+
+	body := ReadBody(request)
+	log.Infof("MD5 sum for body is %x", md5.Sum(body))
+	if body == nil {
+		log.Info("no request body provided for creating lifecycle configuration")
+		WriteErrorResponse(response, request, S3ErrorCode(ErrInvalidLc))
+		return
+	}
+
+	createLifecycleConf := model.LifecycleConfiguration{}
+	err = xml.Unmarshal(body, &createLifecycleConf)
+	if err != nil {
+		log.Errorf("unmarshal error:%v\n", err)
+		WriteErrorResponse(response, request, S3ErrorCode(ErrInvalidLc))
+		return
+	}
+
+	dupIdCheck := make(map[string]interface{})
+	s3RulePtrArr := make([]*s3.LifecycleRule, 0)
+	ruleCount := 0
+	for _, rule := range createLifecycleConf.Rule {
+		if ruleCount > 1000 {
+			log.Error("too many rules\n")
+			WriteApiErrorResponse(response, request, http.StatusBadRequest, AWSErrCodeInvalidArgument,
+				fmt.Sprintf(TooMuchLCRuls, 1000))
+			return
+		}
+
+		s3Rule := s3.LifecycleRule{}
+
+		if len(rule.ID) > IdLimiteLen {
+			log.Errorf("ruleID is too long : %s\n", rule.ID)
+			WriteApiErrorResponse(response, request, http.StatusBadRequest, AWSErrCodeInvalidArgument,
+				InvalidRuleId)
+			return
+		}
+		if rule.ID == "" {
+			// create a random rule id
+			rule.ID, err = getRandID()
+			if err != nil {
+				log.Errorf("get random id failed:%v\n", err)
+				WriteApiErrorResponse(response, request, http.StatusInternalServerError,
+					ErrInternalError.AwsErrorCode(), ErrInternalError.Description())
+				return
+			}
+		}
+
+		//check if the ruleID has any duplicate values
+		if _, ok := dupIdCheck[rule.ID]; ok {
+			log.Errorf("duplicate ruleID found for rule : %s\n", rule.ID)
+			WriteApiErrorResponse(response, request, http.StatusBadRequest, AWSErrCodeInvalidArgument,
+				fmt.Sprintf(DuplicateRuleIDError, rule.ID))
+			return
+		}
+		// Assigning the rule ID
+		dupIdCheck[rule.ID] = struct{}{}
+		s3Rule.Id = rule.ID
+
+		//Assigning the status value to s3 status
+		log.Infof("status in rule file is %v\n", rule.Status)
+		s3Rule.Status = rule.Status
+		if !validLcStatus(s3Rule.Status) {
+			WriteErrorResponse(response, request, ErrMalformedXML)
+			return
+		}
+
+		//Assigning the filter, using convert function to convert xml struct to s3 struct
+		s3Rule.Filter = convertRuleFilterToS3Filter(rule.Filter)
+
+		// Create the type of transition array
+		s3ActionArr := make([]*s3.Action, 0)
+
+		for _, transition := range rule.Transition {
+
+			//Defining the Transition array and assigning the values tp populate fields
+			s3Transition := s3.Action{Name: ActionNameTransition}
+
+			//Assigning the value of days for transition to happen
+			s3Transition.Days = transition.Days
+
+			//Assigning the backend value to the s3 struct
+			s3Transition.Backend = transition.Backend
+
+			//Assigning the storage class of the object to s3 struct
+			tier, err := s.class2tier(transition.StorageClass)
+			if err != nil {
+				response.WriteError(http.StatusBadRequest, err)
+				return
+			}
+			s3Transition.Tier = tier
+
+			//Adding the transition value to the main rule
+			s3ActionArr = append(s3ActionArr, &s3Transition)
+			ruleCount++
+		}
+
+		//Loop for getting the values from xml struct
+		for _, expiration := range rule.Expiration {
+			s3Expiration := s3.Action{Name: ActionNameExpiration}
+			s3Expiration.Days = expiration.Days
+			s3ActionArr = append(s3ActionArr, &s3Expiration)
+			ruleCount++
+		}
+
+		//validate actions
+		err := checkValidationOfActions(s3ActionArr)
+		if err != nil {
+			log.Errorf("validation of actions failed: %v\n", err)
+			WriteApiErrorResponse(response, request, http.StatusBadRequest, AWSErrCodeInvalidArgument, err.Error())
+			return
+		}
+
+		//Assigning the Expiration action to s3 struct expiration
+		s3Rule.Actions = s3ActionArr
+
+		s3Rule.AbortIncompleteMultipartUpload = convertRuleUploadToS3Upload(rule.AbortIncompleteMultipartUpload)
+
+		// add to the s3 array
+		s3RulePtrArr = append(s3RulePtrArr, &s3Rule)
+	}
+
+	lcRsp, err := s.s3Client.PutBucketLifecycle(ctx, &s3.PutBucketLifecycleRequest{BucketName: bucketName, Lc: s3RulePtrArr})
+	if HandleS3Error(response, request, err, lcRsp.GetErrorCode()) != nil {
+		log.Errorf("put bucket[%s] lifecycle failed, err=%v, errCode=%d\n", bucketName, err, lcRsp.GetErrorCode())
+		return
+	}
+
+	log.Info("create bucket lifecycle successful.")
+	WriteSuccessResponse(response, nil)
+}
+
+func convertRuleFilterToS3Filter(filter *model.Filter) *s3.LifecycleFilter {
+	if filter == nil || filter.Prefix == "" {
 		return nil
 	}
+
+	return &s3.LifecycleFilter{Prefix: filter.Prefix}
 }
 
-func convertRuleUploadToS3Upload(upload model.AbortIncompleteMultipartUpload) *s3.AbortMultipartUpload {
-	retUpload := s3.AbortMultipartUpload{}
-	retUpload.DaysAfterInitiation = upload.DaysAfterInitiation
-	return &retUpload
+func convertRuleUploadToS3Upload(upload *model.AbortIncompleteMultipartUpload) *s3.AbortMultipartUpload {
+	if upload == nil || upload.DaysAfterInitiation <= 0 {
+		return nil
+	}
+
+	return &s3.AbortMultipartUpload{DaysAfterInitiation: upload.DaysAfterInitiation}
 }

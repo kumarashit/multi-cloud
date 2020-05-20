@@ -16,64 +16,86 @@ package s3
 
 import (
 	"encoding/xml"
-	"net/http"
+	"strings"
 	"time"
 
 	"github.com/emicklei/go-restful"
-	"github.com/micro/go-log"
-	"github.com/opensds/multi-cloud/api/pkg/policy"
-	. "github.com/opensds/multi-cloud/s3/pkg/exception"
+	"github.com/opensds/multi-cloud/api/pkg/common"
+	c "github.com/opensds/multi-cloud/api/pkg/context"
+	"github.com/opensds/multi-cloud/s3/error"
 	"github.com/opensds/multi-cloud/s3/pkg/model"
-	s3 "github.com/opensds/multi-cloud/s3/proto"
-	"golang.org/x/net/context"
+	"github.com/opensds/multi-cloud/s3/pkg/utils"
+	"github.com/opensds/multi-cloud/s3/proto"
+	pb "github.com/opensds/multi-cloud/s3/proto"
+	log "github.com/sirupsen/logrus"
 )
 
 func (s *APIService) BucketPut(request *restful.Request, response *restful.Response) {
-	if !policy.Authorize(request, response, "bucket:put") {
+	bucketName := strings.ToLower(request.PathParameter(common.REQUEST_PATH_BUCKET_NAME))
+	if !isValidBucketName(bucketName) {
+		WriteErrorResponse(response, request, s3error.ErrInvalidBucketName)
 		return
 	}
-	bucketName := request.PathParameter("bucketName")
-	log.Logf("Received request for create bucket: %s", bucketName)
-	ctx := context.Background()
-	bucket := s3.Bucket{Name: bucketName}
-	body := ReadBody(request)
-	//TODO owner
-	owner := "test"
-	ownerDisplayName := "test"
-	bucket.Owner = owner
-	bucket.Deleted = false
-	bucket.OwnerDisplayName = ownerDisplayName
-	bucket.CreationDate = time.Now().Unix()
+	log.Infof("received request: PUT bucket[name=%s]\n", bucketName)
 
-	if body != nil {
+	if len(request.HeaderParameter(common.REQUEST_HEADER_CONTENT_LENGTH)) == 0 {
+		log.Errorf("missing content length")
+		WriteErrorResponse(response, request, s3error.ErrMissingContentLength)
+		return
+	}
+
+	acl, err := getAclFromHeader(request)
+	if err != nil {
+		log.Errorln("failed to get canned acl. err:", err)
+		WriteErrorResponse(response, request, err)
+		return
+	}
+
+	ctx := common.InitCtxWithAuthInfo(request)
+	actx := request.Attribute(c.KContext).(*c.Context)
+	bucket := s3.Bucket{Name: bucketName}
+	bucket.TenantId = actx.TenantId
+	bucket.UserId = actx.UserId
+	bucket.Deleted = false
+	bucket.CreateTime = time.Now().Unix()
+	bucket.Versioning = &s3.BucketVersioning{}
+	bucket.Versioning.Status = utils.VersioningDisabled // it's the default
+	bucket.Acl = &pb.Acl{CannedAcl: acl.CannedAcl}
+	log.Infof("Bucket PUT: TenantId=%s, UserId=%s\n", bucket.TenantId, bucket.UserId)
+
+	body := ReadBody(request)
+	flag := false
+	if body != nil && len(body) != 0 {
+		log.Infof("request body is not empty")
 		createBucketConf := model.CreateBucketConfiguration{}
 		err := xml.Unmarshal(body, &createBucketConf)
 		if err != nil {
-			response.WriteError(http.StatusInternalServerError, err)
+			log.Infof("unmarshal failed, body:%v, err:%v\n", body, err)
+			WriteErrorResponse(response, request, s3error.ErrUnmarshalFailed)
 			return
-		} else {
-			backendName := createBucketConf.LocationConstraint
-			if backendName != "" {
-				log.Logf("backendName is %v\n", backendName)
-				bucket.Backend = backendName
-				client := getBackendByName(s, backendName)
-				if client == nil {
-					response.WriteError(http.StatusInternalServerError, NoSuchType.Error())
-					return
-				}
-			} else {
-				log.Log("default backend is not provided.")
-				response.WriteError(http.StatusBadRequest, NoSuchBackend.Error())
-				return
-			}
+		}
+
+		backendName := createBucketConf.LocationConstraint
+		if backendName != "" {
+			log.Infof("backendName is %v\n", backendName)
+			bucket.DefaultLocation = backendName
+			flag = s.isBackendExist(ctx, backendName)
 		}
 	}
-
-	res, err := s.s3Client.CreateBucket(ctx, &bucket)
-	if err != nil {
-		response.WriteError(http.StatusInternalServerError, err)
+	if flag == false {
+		log.Errorf("default backend is not provided or it is not exist.")
+		WriteErrorResponse(response, request, s3error.ErrGetBackendFailed)
 		return
 	}
-	log.Log("Create bucket successfully.")
-	response.WriteEntity(res)
+
+	rsp, err := s.s3Client.CreateBucket(ctx, &bucket)
+	if HandleS3Error(response, request, err, rsp.GetErrorCode()) != nil {
+		log.Errorf("delete bucket[%s] failed, err=%v, errCode=%d\n", bucketName, err, rsp.GetErrorCode())
+		return
+	}
+
+	log.Infof("create bucket[name=%s, defaultLocation=%s] successfully.\n", bucket.Name, bucket.DefaultLocation)
+	// Make sure to add Location information here only for bucket
+	response.Header().Set("Location", GetLocation(request.Request))
+	WriteSuccessResponse(response, nil)
 }
