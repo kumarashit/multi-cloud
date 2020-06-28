@@ -877,7 +877,7 @@ paths:
                   fileshares:
                     type: array
                     items:
-                      $ref: '#/components/schemas/volumeResult'
+                      $ref: '#/components/schemas/VolumeResult'
                   next:
                     type: integer
   '/v1/{tenantId}/file/shares':
@@ -1941,7 +1941,7 @@ components:
           type: string
           example: sap_vol01
         Type:
-          description: The volume type. (Like for aws: gp2, sc1, io1, st1)
+          description: The volume type. Like for aws gp2, sc1, io1, st1
           type: string
           example: gp2
         Size:
